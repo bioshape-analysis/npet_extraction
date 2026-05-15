@@ -160,40 +160,77 @@ def write_summary_csv(
             ])
 
 
+def _smooth_and_trim(
+    arc: List[float],
+    rad: List[float],
+    smooth_sigma_A: float,
+    trim_A: float,
+    resample_step_A: float = 0.5,
+) -> Tuple[List[float], List[float]]:
+    """Drop `trim_A` from each end of the curve, then Gaussian-smooth the
+    radius with sigma=`smooth_sigma_A`."""
+    import numpy as np
+    from scipy.ndimage import gaussian_filter1d
+
+    a = np.asarray(arc, dtype=float)
+    r = np.asarray(rad, dtype=float)
+    if a.size < 5:
+        return list(a), list(r)
+
+    keep = (a >= trim_A) & (a <= a[-1] - trim_A)
+    if keep.sum() < 5:
+        keep = np.ones_like(a, dtype=bool)
+    a = a[keep]
+    r = r[keep]
+
+    sigma_samples = max(1.0, smooth_sigma_A / float(resample_step_A))
+    r_smooth = gaussian_filter1d(r, sigma=sigma_samples, mode="nearest")
+    return list(a), list(r_smooth)
+
+
 def plot_overlay(
     data: Dict[str, Dict],
     out_path: Path,
     radius_field: str,
     title: str,
+    smooth_sigma_A: float = 2.0,
+    trim_A: float = 3.0,
+    xlim: Optional[Tuple[float, float]] = None,
+    ylim: Optional[Tuple[float, float]] = None,
 ) -> None:
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(12, 7))
+    fig, ax = plt.subplots(figsize=(10, 6))
+
     for sid in sorted(data.keys()):
         d = data[sid]
         kingdom = KINGDOM_BY_PDB.get(sid, "?")
         color = KINGDOM_COLORS.get(kingdom, "gray")
-        ax.plot(d["arc_length_A"], d[radius_field],
-                color=color, alpha=0.7, linewidth=1.0)
-        # label at the rightmost point of each curve
-        ax.annotate(
-            sid,
-            xy=(d["arc_length_A"][-1], d[radius_field][-1]),
-            xytext=(3, 0), textcoords="offset points",
-            fontsize=6, color=color, va="center",
+        arc, rad = _smooth_and_trim(
+            d["arc_length_A"], d[radius_field],
+            smooth_sigma_A=smooth_sigma_A,
+            trim_A=trim_A,
         )
+        ax.plot(arc, rad, color=color, alpha=0.7, linewidth=1.2)
 
-    # legend swatches by kingdom
+    # one legend swatch per kingdom (count actual structures plotted)
+    by_king: Dict[str, int] = {}
+    for s in data:
+        by_king[KINGDOM_BY_PDB.get(s, "?")] = by_king.get(KINGDOM_BY_PDB.get(s, "?"), 0) + 1
     handles = [
-        plt.Line2D([0], [0], color=col, label=k.capitalize(), linewidth=2.0)
-        for k, col in KINGDOM_COLORS.items()
-        if any(KINGDOM_BY_PDB.get(s) == k for s in data.keys())
+        plt.Line2D([0], [0], color=KINGDOM_COLORS.get(k, "gray"),
+                   label=f"{k.capitalize()} (n={by_king[k]})", linewidth=2.0)
+        for k in KINGDOM_ORDER if by_king.get(k)
     ]
-    ax.legend(handles=handles, loc="upper right", frameon=False)
+    ax.legend(handles=handles, loc="lower right", frameon=False, fontsize=9)
 
-    ax.set_xlabel("arc length from PTC (A)")
-    ax.set_ylabel(f"{radius_field} (A)")
+    ax.set_xlabel("arc length from PTC (Å)")
+    ax.set_ylabel(f"{radius_field.replace('_', ' ')} (Å)")
     ax.set_title(title)
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
     ax.grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -205,6 +242,10 @@ def plot_by_kingdom(
     out_path: Path,
     radius_field: str,
     title: str,
+    smooth_sigma_A: float = 2.0,
+    trim_A: float = 3.0,
+    xlim: Optional[Tuple[float, float]] = None,
+    ylim: Optional[Tuple[float, float]] = None,
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -215,29 +256,41 @@ def plot_by_kingdom(
 
     panels = [k for k in KINGDOM_ORDER if by_king.get(k)]
     n = len(panels) or 1
-    fig, axes = plt.subplots(1, n, figsize=(5 * n, 5), sharex=True, sharey=True)
+    fig, axes = plt.subplots(1, n, figsize=(4.5 * n, 4.5), sharex=True, sharey=True)
     if n == 1:
         axes = [axes]
 
-    # global axis bounds for parity
-    arc_max = max(max(d["arc_length_A"]) for d in data.values())
-    r_max = max(max(d[radius_field]) for d in data.values())
+    # Apply smoothing+trim before computing axis bounds so the ylim isn't
+    # set by the noisy endpoint artifacts.
+    smoothed: Dict[str, Tuple[List[float], List[float]]] = {}
+    for sid, d in data.items():
+        smoothed[sid] = _smooth_and_trim(
+            d["arc_length_A"], d[radius_field],
+            smooth_sigma_A=smooth_sigma_A, trim_A=trim_A,
+        )
+
+    if xlim is None:
+        arc_max = max(s[0][-1] for s in smoothed.values())
+        xlim = (0, arc_max * 1.02)
+    if ylim is None:
+        r_max = max(max(s[1]) for s in smoothed.values())
+        r_min = min(min(s[1]) for s in smoothed.values())
+        ylim = (max(0.0, r_min - 0.5), r_max * 1.05)
 
     for ax, kingdom in zip(axes, panels):
         sids = sorted(by_king[kingdom])
         color = KINGDOM_COLORS.get(kingdom, "gray")
         for sid in sids:
-            d = data[sid]
-            ax.plot(d["arc_length_A"], d[radius_field],
-                    color=color, alpha=0.6, linewidth=1.0, label=sid)
+            arc, rad = smoothed[sid]
+            ax.plot(arc, rad, color=color, alpha=0.7, linewidth=1.2, label=sid)
         ax.set_title(f"{kingdom.capitalize()} (n={len(sids)})")
-        ax.set_xlim(0, arc_max * 1.05)
-        ax.set_ylim(0, r_max * 1.05)
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
         ax.grid(alpha=0.3)
-        ax.set_xlabel("arc length from PTC (A)")
-        ax.legend(fontsize=6, loc="upper right", frameon=False)
+        ax.set_xlabel("arc length from PTC (Å)")
+        ax.legend(fontsize=7, loc="upper right", frameon=False, ncol=1)
 
-    axes[0].set_ylabel(f"{radius_field} (A)")
+    axes[0].set_ylabel(f"{radius_field.replace('_', ' ')} (Å)")
     fig.suptitle(title)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -261,6 +314,19 @@ def main(argv=None):
                     help="Which radius column to plot. 'inscribed' = "
                          "inscribed_radius_A (MOLE probe semantics, default). "
                          "'cross' = cross_section_radius_A (perpendicular-plane).")
+    ap.add_argument("--smooth", type=float, default=2.0, metavar="A",
+                    help="Gaussian smoothing sigma in Angstroms applied to each "
+                         "radius curve. 0 = no smoothing. Default: 2.0")
+    ap.add_argument("--trim", type=float, default=3.0, metavar="A",
+                    help="Trim this many Angstroms from each end of every "
+                         "curve before plotting. Removes wall-hugging endpoint "
+                         "artifacts from the source/sink Dijkstra voxels. Default: 3.0")
+    ap.add_argument("--xlim", type=float, nargs=2, metavar=("MIN", "MAX"), default=None,
+                    help="x-axis range. Default: auto-fit.")
+    ap.add_argument("--ylim", type=float, nargs=2, metavar=("MIN", "MAX"), default=None,
+                    help="y-axis range. Default: auto-fit (try '1 10' to match the paper).")
+    ap.add_argument("--no-kingdom-panels", action="store_true",
+                    help="Skip the 4-panel by-kingdom plot (only emit the overlay).")
     args = ap.parse_args(argv)
 
     runs_root = _runs_root(args.runs_root)
@@ -285,21 +351,32 @@ def main(argv=None):
     label = "inscribed (MOLE-probe)" if args.radius == "inscribed" else "cross-section (perpendicular plane)"
 
     args.out.mkdir(parents=True, exist_ok=True)
+    xlim = tuple(args.xlim) if args.xlim else None
+    ylim = tuple(args.ylim) if args.ylim else None
+
     plot_overlay(
         data, args.out / "centerline_overlay.png",
         radius_field=radius_field,
         title=f"Exit-tunnel radius profiles ({label})",
+        smooth_sigma_A=args.smooth,
+        trim_A=args.trim,
+        xlim=xlim, ylim=ylim,
     )
-    plot_by_kingdom(
-        data, args.out / "centerline_by_kingdom.png",
-        radius_field=radius_field,
-        title=f"Exit-tunnel radius profiles by kingdom ({label})",
-    )
+    if not args.no_kingdom_panels:
+        plot_by_kingdom(
+            data, args.out / "centerline_by_kingdom.png",
+            radius_field=radius_field,
+            title=f"Exit-tunnel radius profiles by kingdom ({label})",
+            smooth_sigma_A=args.smooth,
+            trim_A=args.trim,
+            xlim=xlim, ylim=ylim,
+        )
     write_summary_csv(data, args.out / "centerline_summary.csv", radius_field)
 
     print(f"\nWrote:")
     print(f"  {args.out / 'centerline_overlay.png'}")
-    print(f"  {args.out / 'centerline_by_kingdom.png'}")
+    if not args.no_kingdom_panels:
+        print(f"  {args.out / 'centerline_by_kingdom.png'}")
     print(f"  {args.out / 'centerline_summary.csv'}")
     return 0
 
