@@ -15,6 +15,7 @@ class ArtifactType(str, Enum):
     PNG      = "png"
     TXT      = "txt"
     MMCIF    = "mmcif"
+    CSV      = "csv"
 
 
 @dataclass(frozen=True)

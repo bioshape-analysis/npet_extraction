@@ -125,3 +125,11 @@ class RunConfig:
     lining_proximity_A        : float = 5.0
     lining_include_nonpolymers: bool  = True
     lining_include_waters     : bool  = False
+
+    # === Stage60: Centerline extraction (MOLE-style probe CSV) ===
+    centerline_enabled        : bool  = True
+    centerline_open_radius_A  : float = 1.0    # binary_opening ball radius; prunes side-channels narrower than this
+    centerline_path_alpha     : float = 1.0    # Dijkstra cost weight: step_length * (1 + alpha/EDT_voxels)
+    centerline_resample_step_A: float = 0.5    # uniform arc-length resample step for the output curve
+    centerline_smoothing      : float = 0.0    # splprep smoothing factor (0 = pass through points)
+    centerline_n_radial_rays  : int   = 64     # rays per perpendicular plane for cross_section_radius_A

@@ -131,6 +131,38 @@ def _build_parser() -> argparse.ArgumentParser:
     cfg.add_argument("--include-waters", action="store_true",
                     help="Include water molecules in lining output")
     # -------------------------------------------------------------------------
+    # centerline (standalone: re-run Stage60 on an existing run)
+    # -------------------------------------------------------------------------
+    cl_p = sub.add_parser(
+        "centerline",
+        help="Extract a MOLE-style centerline + radius CSV from an existing run",
+        description=(
+            "Runs Stage60 (centerline extraction) on an existing run directory. "
+            "Re-runs only the centerline step; the rest of the pipeline output is preserved. "
+            "Use this to sweep --r-open or --alpha without re-running the whole pipeline."
+        ),
+    )
+    cl_p.add_argument("rcsb_id", metavar="RCSB_ID",
+                      help="RCSB ID of the structure (e.g. 5NWY)")
+    cl_p.add_argument("--run-id", metavar="RUN_ID",
+                      help="Specific run_id under <runs_root>/<RCSB_ID>/. "
+                           "If omitted, uses the most-recently-modified run.")
+    cl_p.add_argument("--data-dir", metavar="DIR",
+                      help="Root directory for npet2 data (default: ~/.npet2 or $NPET2_ROOT)")
+    cl_p.add_argument("--output-dir", metavar="DIR",
+                      help="Root directory containing runs (default: $NPET2_RUNS_ROOT)")
+    cl_p.add_argument("--r-open", type=float, metavar="A", default=None,
+                      help="Side-channel pruning radius in Angstroms (default: 1.0)")
+    cl_p.add_argument("--alpha", type=float, metavar="N", default=None,
+                      help="Dijkstra cost weight for clearance bias (default: 1.0)")
+    cl_p.add_argument("--resample-step", type=float, metavar="A", default=None,
+                      help="Uniform arc-length resample step in Angstroms (default: 0.5)")
+    cl_p.add_argument("--smoothing", type=float, metavar="S", default=None,
+                      help="Spline smoothing factor (default: 0.0 = pass through)")
+    cl_p.add_argument("--n-rays", type=int, metavar="N", default=None,
+                      help="Rays per perpendicular plane for cross-section radius (default: 64)")
+
+    # -------------------------------------------------------------------------
     # show-config
     # -------------------------------------------------------------------------
     sub.add_parser("show-config", help="Print the default RunConfig as JSON")
@@ -416,6 +448,104 @@ def _cmd_setup(args=None):
     print("  setup complete. You can now run: npet2 run <RCSB_ID>")
 
 
+def _cmd_centerline(args) -> None:
+    """Re-run Stage60Centerline on an existing run directory."""
+    _apply_data_dir(args)
+    import libnpet.core.config as cfg_mod
+    from libnpet.core.manifest import RunManifest
+    from libnpet.core.store import LocalRunStore
+    from libnpet.core.types import StageContext
+    from libnpet.core.config import RunConfig
+    from libnpet.stages.centerline import Stage60Centerline
+
+    output_root = Path(args.output_dir) if args.output_dir else cfg_mod.SETTINGS.runs_root
+    rcsb_id = args.rcsb_id.upper()
+    struct_runs_dir = output_root / rcsb_id
+
+    if not struct_runs_dir.exists():
+        print(f"Error: no runs found at {struct_runs_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.run_id:
+        run_dir = struct_runs_dir / args.run_id
+        if not run_dir.exists():
+            print(f"Error: run {run_dir} does not exist", file=sys.stderr)
+            sys.exit(1)
+    else:
+        candidates = [d for d in struct_runs_dir.iterdir() if d.is_dir()]
+        if not candidates:
+            print(f"Error: no runs under {struct_runs_dir}", file=sys.stderr)
+            sys.exit(1)
+        run_dir = max(candidates, key=lambda d: d.stat().st_mtime)
+        print(f"npet2 centerline: using most-recent run {run_dir.name}")
+
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.exists():
+        print(f"Error: no manifest.json at {manifest_path}", file=sys.stderr)
+        sys.exit(1)
+
+    grid_spec_path = run_dir / "stage" / "55_grid_refine" / "grid_spec_level_1.json"
+    mask_path = run_dir / "stage" / "55_grid_refine" / "selected_void_component_mask_level_1.npy"
+    if not grid_spec_path.exists() or not mask_path.exists():
+        print(
+            f"Error: Stage55 artifacts not found under {run_dir}.\n"
+            f"  expected {grid_spec_path}\n"
+            f"  expected {mask_path}\n"
+            f"Run the full pipeline first: npet2 run {rcsb_id}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    grid_spec = json.loads(grid_spec_path.read_text())
+    ptc_world = grid_spec["transform"]["ptc"]
+    constr_world = grid_spec["transform"]["constriction"]
+
+    cfg_overrides = {}
+    if args.r_open is not None:
+        cfg_overrides["centerline_open_radius_A"] = args.r_open
+    if args.alpha is not None:
+        cfg_overrides["centerline_path_alpha"] = args.alpha
+    if args.resample_step is not None:
+        cfg_overrides["centerline_resample_step_A"] = args.resample_step
+    if args.smoothing is not None:
+        cfg_overrides["centerline_smoothing"] = args.smoothing
+    if args.n_rays is not None:
+        cfg_overrides["centerline_n_radial_rays"] = args.n_rays
+    config = RunConfig(**cfg_overrides)
+
+    manifest = RunManifest.from_path(manifest_path)
+    store = LocalRunStore(run_dir=run_dir, manifest=manifest)
+    ctx = StageContext(
+        run_id=manifest.run_id,
+        rcsb_id=rcsb_id,
+        config=config,
+        store=store,
+        inputs={
+            "selected_void_component_mask_level_1_path": str(mask_path),
+            "grid_spec_level_1_path": str(grid_spec_path),
+            "ptc_xyz": ptc_world,
+            "constriction_xyz": constr_world,
+        },
+    )
+
+    stage = Stage60Centerline()
+    params = stage.params(ctx)
+    store.begin_stage(stage.key, params=params)
+    print(f"npet2 centerline: run_dir={run_dir}")
+    print(f"  params: {params}")
+    try:
+        stage.run(ctx)
+        store.end_stage(stage.key, success=True)
+    except Exception as e:
+        store.end_stage(stage.key, success=False, note=f"err={e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+    print(f"npet2 centerline: done")
+    print(f"  CSV: {run_dir / 'stage' / '60_centerline' / 'centerline.csv'}")
+    print(f"  PLY: {run_dir / 'stage' / '60_centerline' / 'centerline.ply'}")
+
+
 def main():
     parser = _build_parser()
     args = parser.parse_args()
@@ -431,6 +561,10 @@ def main():
     if args.command == "show-config":
         from libnpet.core.config import RunConfig
         print(json.dumps(asdict(RunConfig()), indent=2))
+        return
+
+    if args.command == "centerline":
+        _cmd_centerline(args)
         return
 
     if args.command == "run":

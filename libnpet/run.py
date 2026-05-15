@@ -15,6 +15,7 @@ from libnpet.core.pipeline import Pipeline
 from libnpet.core.cache import LocalStageCache
 from libnpet.stages.tunnel_lining import Stage80TunnelLining
 from libnpet.stages.bootstrap import Stage00Inputs, Stage10Landmarks
+from libnpet.stages.centerline import Stage60Centerline
 from libnpet.stages.grid_refine import Stage55GridRefine
 from libnpet.stages.legacy_minimal import (
     Stage20ExteriorShell,
@@ -95,6 +96,7 @@ def run_npet2(
         Stage40EmptySpace(),
         Stage50Clustering(),
         Stage55GridRefine(),
+        Stage60Centerline(),
         Stage70MeshValidate(),
         Stage80TunnelLining(),
     ])

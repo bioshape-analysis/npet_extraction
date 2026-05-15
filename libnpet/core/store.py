@@ -86,6 +86,7 @@ class LocalRunStore(ArtifactStore):
             ArtifactType.TXT: ".txt",
             ArtifactType.PLY_MESH: ".ply",
             ArtifactType.PLY_PCD: ".ply",
+            ArtifactType.CSV: ".csv",
         }[type]
         out = self.stage_dir(stage) / f"{name}{suffix}"
         out.write_bytes(data)
