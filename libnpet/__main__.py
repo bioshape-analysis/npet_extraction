@@ -130,6 +130,14 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Exclude nonpolymer ligands/ions from lining output")
     cfg.add_argument("--include-waters", action="store_true",
                     help="Include water molecules in lining output")
+    cfg.add_argument("--exclude-chains", metavar="CHAIN", nargs="+", default=None,
+                    help="auth_asym_id chains to exclude from the occupancy mask. "
+                         "Use this to drop nascent chains, modelled debris, or any "
+                         "chain that should not count as a tunnel wall. "
+                         "Example: --exclude-chains G2 (for 9RHU nascent chain)")
+    cfg.add_argument("--keep-trna", action="store_true",
+                    help="Do NOT auto-exclude tRNAs from the occupancy mask "
+                         "(default: tRNAs are excluded)")
     # -------------------------------------------------------------------------
     # centerline (standalone: re-run Stage60 on an existing run)
     # -------------------------------------------------------------------------
@@ -210,6 +218,10 @@ def _build_config(args) -> "RunConfig":
         kwargs["lining_include_nonpolymers"] = False
     if args.include_waters:
         kwargs["lining_include_waters"] = True
+    if args.exclude_chains:
+        kwargs["occupancy_exclude_auth_asym_ids"] = tuple(args.exclude_chains)
+    if args.keep_trna:
+        kwargs["occupancy_exclude_trna"] = False
     return RunConfig(**kwargs)
 
 
