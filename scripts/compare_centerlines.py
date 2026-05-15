@@ -166,9 +166,12 @@ def _smooth_and_trim(
     smooth_sigma_A: float,
     trim_A: float,
     resample_step_A: float = 0.5,
+    max_arc_A: Optional[float] = None,
 ) -> Tuple[List[float], List[float]]:
-    """Drop `trim_A` from each end of the curve, then Gaussian-smooth the
-    radius with sigma=`smooth_sigma_A`."""
+    """Optionally hard-truncate at `max_arc_A`, drop `trim_A` from each end,
+    then Gaussian-smooth the radius with sigma=`smooth_sigma_A`. `max_arc_A`
+    is applied first so the trim and smoothing operate on the already-clipped
+    curve."""
     import numpy as np
     from scipy.ndimage import gaussian_filter1d
 
@@ -176,6 +179,12 @@ def _smooth_and_trim(
     r = np.asarray(rad, dtype=float)
     if a.size < 5:
         return list(a), list(r)
+
+    if max_arc_A is not None and max_arc_A > 0:
+        cap = (a <= float(max_arc_A))
+        if cap.sum() >= 5:
+            a = a[cap]
+            r = r[cap]
 
     keep = (a >= trim_A) & (a <= a[-1] - trim_A)
     if keep.sum() < 5:
@@ -212,6 +221,7 @@ def pairwise_quarter_distances(
     trim_A: float,
     n_grid: int = 400,
     n_quarters: int = 4,
+    max_arc_A: Optional[float] = None,
 ) -> Dict[Tuple[str, int], List[float]]:
     """For each pair of structures (i, j), normalize both tunnel radius profiles
     to the same [0, 1] arc grid, split into `n_quarters` equal regions, and
@@ -228,6 +238,7 @@ def pairwise_quarter_distances(
         arc, rad = _smooth_and_trim(
             d["arc_length_A"], d[radius_field],
             smooth_sigma_A=smooth_sigma_A, trim_A=trim_A,
+            max_arc_A=max_arc_A,
         )
         prof = _normalized_profile(arc, rad, n_grid=n_grid)
         if prof is not None:
@@ -280,6 +291,7 @@ def plot_pairwise_distance_quarters(
     trim_A: float = 3.0,
     pair_types: Tuple[str, ...] = PAPER_PAIR_TYPES,
     n_quarters: int = 4,
+    max_arc_A: Optional[float] = None,
 ) -> Dict[Tuple[str, int], List[float]]:
     """Bar chart reproducing the paper Figure 3C style: per-quarter mean ± SEM
     RMS radius difference between structure pairs, grouped by kingdom-pair
@@ -291,7 +303,7 @@ def plot_pairwise_distance_quarters(
     dists = pairwise_quarter_distances(
         data, radius_field=radius_field,
         smooth_sigma_A=smooth_sigma_A, trim_A=trim_A,
-        n_quarters=n_quarters,
+        n_quarters=n_quarters, max_arc_A=max_arc_A,
     )
 
     quarters = list(range(1, n_quarters + 1))
@@ -341,6 +353,7 @@ def plot_overlay(
     trim_A: float = 3.0,
     xlim: Optional[Tuple[float, float]] = None,
     ylim: Optional[Tuple[float, float]] = None,
+    max_arc_A: Optional[float] = None,
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -354,6 +367,7 @@ def plot_overlay(
             d["arc_length_A"], d[radius_field],
             smooth_sigma_A=smooth_sigma_A,
             trim_A=trim_A,
+            max_arc_A=max_arc_A,
         )
         ax.plot(arc, rad, color=color, alpha=0.7, linewidth=1.2)
 
@@ -390,6 +404,7 @@ def plot_by_kingdom(
     trim_A: float = 3.0,
     xlim: Optional[Tuple[float, float]] = None,
     ylim: Optional[Tuple[float, float]] = None,
+    max_arc_A: Optional[float] = None,
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -411,6 +426,7 @@ def plot_by_kingdom(
         smoothed[sid] = _smooth_and_trim(
             d["arc_length_A"], d[radius_field],
             smooth_sigma_A=smooth_sigma_A, trim_A=trim_A,
+            max_arc_A=max_arc_A,
         )
 
     if xlim is None:
@@ -465,6 +481,10 @@ def main(argv=None):
                     help="Trim this many Angstroms from each end of every "
                          "curve before plotting. Removes wall-hugging endpoint "
                          "artifacts from the source/sink Dijkstra voxels. Default: 3.0")
+    ap.add_argument("--max-arc", type=float, default=100.0, metavar="A",
+                    help="Hard-truncate every curve at this arc length before "
+                         "smoothing/trim. Use 0 to disable. Default: 100.0 "
+                         "(matches the paper's effective tunnel length).")
     ap.add_argument("--xlim", type=float, nargs=2, metavar=("MIN", "MAX"), default=None,
                     help="x-axis range. Default: auto-fit.")
     ap.add_argument("--ylim", type=float, nargs=2, metavar=("MIN", "MAX"), default=None,
@@ -503,6 +523,7 @@ def main(argv=None):
     args.out.mkdir(parents=True, exist_ok=True)
     xlim = tuple(args.xlim) if args.xlim else None
     ylim = tuple(args.ylim) if args.ylim else None
+    max_arc = float(args.max_arc) if args.max_arc and args.max_arc > 0 else None
 
     plot_overlay(
         data, args.out / "centerline_overlay.png",
@@ -511,6 +532,7 @@ def main(argv=None):
         smooth_sigma_A=args.smooth,
         trim_A=args.trim,
         xlim=xlim, ylim=ylim,
+        max_arc_A=max_arc,
     )
     if not args.no_kingdom_panels:
         plot_by_kingdom(
@@ -520,6 +542,7 @@ def main(argv=None):
             smooth_sigma_A=args.smooth,
             trim_A=args.trim,
             xlim=xlim, ylim=ylim,
+            max_arc_A=max_arc,
         )
     pair_dists = None
     if not args.no_pair_bars:
@@ -530,6 +553,7 @@ def main(argv=None):
             smooth_sigma_A=args.smooth,
             trim_A=args.trim,
             n_quarters=args.n_quarters,
+            max_arc_A=max_arc,
         )
         # Also dump the raw per-pair distances so the user can reanalyze.
         import numpy as np
