@@ -188,6 +188,150 @@ def _smooth_and_trim(
     return list(a), list(r_smooth)
 
 
+def _normalized_profile(
+    arc: List[float],
+    rad: List[float],
+    n_grid: int = 400,
+):
+    """Stretch arc to [0, 1] and interpolate radius onto a regular grid.
+    Used for cross-structure comparison where tunnels have different lengths."""
+    import numpy as np
+    a = np.asarray(arc, dtype=float)
+    r = np.asarray(rad, dtype=float)
+    if a.size < 3 or a[-1] - a[0] <= 0:
+        return None
+    a_norm = (a - a[0]) / (a[-1] - a[0])
+    grid = np.linspace(0.0, 1.0, int(n_grid))
+    return np.interp(grid, a_norm, r)
+
+
+def pairwise_quarter_distances(
+    data: Dict[str, Dict],
+    radius_field: str,
+    smooth_sigma_A: float,
+    trim_A: float,
+    n_grid: int = 400,
+    n_quarters: int = 4,
+) -> Dict[Tuple[str, int], List[float]]:
+    """For each pair of structures (i, j), normalize both tunnel radius profiles
+    to the same [0, 1] arc grid, split into `n_quarters` equal regions, and
+    compute the RMS radius difference within each region. Return a dict keyed
+    by (pair_category, quarter_index) mapping to the list of pair RMS values.
+
+    pair_category is e.g. 'Bacteria/Bacteria', 'Eukarya/Eukarya',
+    'Bacteria/Eukarya'. Kingdom labels are alphabetized so 'B/E' and 'E/B'
+    collapse together."""
+    import numpy as np
+
+    profiles: Dict[str, "np.ndarray"] = {}
+    for sid, d in data.items():
+        arc, rad = _smooth_and_trim(
+            d["arc_length_A"], d[radius_field],
+            smooth_sigma_A=smooth_sigma_A, trim_A=trim_A,
+        )
+        prof = _normalized_profile(arc, rad, n_grid=n_grid)
+        if prof is not None:
+            profiles[sid] = prof
+
+    sids = sorted(profiles.keys())
+    q_size = n_grid // n_quarters
+    out: Dict[Tuple[str, int], List[float]] = {}
+
+    for i, sid_a in enumerate(sids):
+        kg_a = KINGDOM_BY_PDB.get(sid_a, "?").capitalize()
+        for sid_b in sids[i + 1:]:
+            kg_b = KINGDOM_BY_PDB.get(sid_b, "?").capitalize()
+            if kg_a == kg_b:
+                pair_label = f"{kg_a}/{kg_a}"
+            else:
+                pair_label = "/".join(sorted([kg_a, kg_b]))
+
+            diff_sq = (profiles[sid_a] - profiles[sid_b]) ** 2
+            for q in range(n_quarters):
+                seg = diff_sq[q * q_size:(q + 1) * q_size]
+                rms = float(np.sqrt(np.mean(seg)))
+                out.setdefault((pair_label, q + 1), []).append(rms)
+
+    return out
+
+
+PAIR_COLORS = {
+    "Bacteria/Bacteria": "#e74c3c",  # red
+    "Eukarya/Eukarya":   "#3498db",  # blue
+    "Bacteria/Eukarya":  "#8e44ad",  # purple
+    "Archaea/Archaea":   "#27ae60",  # green
+    "Archaea/Bacteria":  "#d35400",  # orange
+    "Archaea/Eukarya":   "#16a085",  # teal
+}
+
+PAPER_PAIR_TYPES = (
+    "Bacteria/Bacteria",
+    "Eukarya/Eukarya",
+    "Bacteria/Eukarya",
+)
+
+
+def plot_pairwise_distance_quarters(
+    data: Dict[str, Dict],
+    out_path: Path,
+    radius_field: str,
+    title: str,
+    smooth_sigma_A: float = 2.0,
+    trim_A: float = 3.0,
+    pair_types: Tuple[str, ...] = PAPER_PAIR_TYPES,
+    n_quarters: int = 4,
+) -> Dict[Tuple[str, int], List[float]]:
+    """Bar chart reproducing the paper Figure 3C style: per-quarter mean ± SEM
+    RMS radius difference between structure pairs, grouped by kingdom-pair
+    category. Returns the raw pair-distance dict so the caller can dump a CSV
+    of every pair RMS if needed."""
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    dists = pairwise_quarter_distances(
+        data, radius_field=radius_field,
+        smooth_sigma_A=smooth_sigma_A, trim_A=trim_A,
+        n_quarters=n_quarters,
+    )
+
+    quarters = list(range(1, n_quarters + 1))
+    n_pairs = len(pair_types)
+    bar_w = 0.8 / n_pairs
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    for pi, ptype in enumerate(pair_types):
+        means, sems, counts = [], [], []
+        for q in quarters:
+            vals = dists.get((ptype, q), [])
+            if vals:
+                arr = np.asarray(vals)
+                means.append(float(arr.mean()))
+                sems.append(float(arr.std(ddof=1) / np.sqrt(len(arr))) if len(arr) > 1 else 0.0)
+                counts.append(len(arr))
+            else:
+                means.append(0.0); sems.append(0.0); counts.append(0)
+        x = np.asarray(quarters, dtype=float) + (pi - (n_pairs - 1) / 2.0) * bar_w
+        ax.bar(
+            x, means, width=bar_w, yerr=sems, capsize=4,
+            color=PAIR_COLORS.get(ptype, "gray"),
+            edgecolor="black", linewidth=0.5,
+            label=f"{ptype} (n_pairs={counts[0] if counts else 0})",
+        )
+
+    ax.set_xlabel("Tunnel quarter region (PTC -> exit)")
+    ax.set_ylabel(f"RMS radius difference (Å)")
+    ax.set_xticks(quarters)
+    ax.set_xticklabels([str(q) for q in quarters])
+    ax.legend(frameon=False, loc="upper left", fontsize=9)
+    ax.set_title(title)
+    ax.grid(alpha=0.3, axis="y")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+    return dists
+
+
 def plot_overlay(
     data: Dict[str, Dict],
     out_path: Path,
@@ -327,6 +471,12 @@ def main(argv=None):
                     help="y-axis range. Default: auto-fit (try '1 10' to match the paper).")
     ap.add_argument("--no-kingdom-panels", action="store_true",
                     help="Skip the 4-panel by-kingdom plot (only emit the overlay).")
+    ap.add_argument("--no-pair-bars", action="store_true",
+                    help="Skip the per-quarter pairwise-distance bar chart "
+                         "(Figure 3C analog).")
+    ap.add_argument("--n-quarters", type=int, default=4,
+                    help="Number of equal-arc-length quarters to split each "
+                         "tunnel into for the pairwise distance plot. Default: 4.")
     args = ap.parse_args(argv)
 
     runs_root = _runs_root(args.runs_root)
@@ -371,12 +521,38 @@ def main(argv=None):
             trim_A=args.trim,
             xlim=xlim, ylim=ylim,
         )
+    pair_dists = None
+    if not args.no_pair_bars:
+        pair_dists = plot_pairwise_distance_quarters(
+            data, args.out / "centerline_pairwise_distance.png",
+            radius_field=radius_field,
+            title=f"Pairwise tunnel radius distance by quarter ({label})",
+            smooth_sigma_A=args.smooth,
+            trim_A=args.trim,
+            n_quarters=args.n_quarters,
+        )
+        # Also dump the raw per-pair distances so the user can reanalyze.
+        import numpy as np
+        with (args.out / "centerline_pairwise_distance.csv").open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["pair_category", "quarter", "n_pairs", "mean_rmsd_A", "sem_rmsd_A", "values_A"])
+            for (cat, q), vals in sorted(pair_dists.items()):
+                arr = np.asarray(vals, dtype=float)
+                sem = float(arr.std(ddof=1) / np.sqrt(len(arr))) if len(arr) > 1 else 0.0
+                w.writerow([
+                    cat, q, len(arr),
+                    f"{arr.mean():.4f}", f"{sem:.4f}",
+                    ";".join(f"{v:.4f}" for v in arr),
+                ])
     write_summary_csv(data, args.out / "centerline_summary.csv", radius_field)
 
     print(f"\nWrote:")
     print(f"  {args.out / 'centerline_overlay.png'}")
     if not args.no_kingdom_panels:
         print(f"  {args.out / 'centerline_by_kingdom.png'}")
+    if not args.no_pair_bars:
+        print(f"  {args.out / 'centerline_pairwise_distance.png'}")
+        print(f"  {args.out / 'centerline_pairwise_distance.csv'}")
     print(f"  {args.out / 'centerline_summary.csv'}")
     return 0
 
