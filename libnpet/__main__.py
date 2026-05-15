@@ -245,93 +245,15 @@ def _collect_rcsb_ids(args) -> list[str]:
     return [x.upper() for x in ids]
 
 
-def _make_providers(args, rcsb_id: str):
-    from libnpet.adapters.standalone_providers import (
-        FileStructureProvider,
-        FileLandmarkProvider,
-        _download_mmcif,
-    )
-    from libnpet.core.config import SETTINGS
-
-    api_base = args.api_url or SETTINGS.riboxyz_api_base
-
-    # mmCIF: explicit path, or auto-download from RCSB
-    if args.mmcif:
-        mmcif_path = Path(args.mmcif)
-        if not mmcif_path.exists():
-            print(f"Error: --mmcif {mmcif_path} does not exist", file=sys.stderr)
-            sys.exit(1)
-    else:
-        mmcif_path = _download_mmcif(rcsb_id)
-
-    profile_path = Path(args.profile) if args.profile else None
-    ptc_path     = Path(args.ptc)     if args.ptc     else None
-    constr_path  = Path(args.constriction) if args.constriction else None
-
-    sp = FileStructureProvider(
-        mmcif_path=mmcif_path,
-        profile_path=profile_path,
-        api_base=api_base,
-    )
-    lp = FileLandmarkProvider(
-        ptc_path=ptc_path,
-        constriction_path=constr_path,
-        api_base=api_base,
-    )
-    return sp, lp
-
-
-def _apply_data_dir(args) -> None:
-    """Override SETTINGS.npet2_root and derived paths if --data-dir was given."""
-    data_dir = getattr(args, "data_dir", None)
-    if not data_dir:
-        return
-    import libnpet.core.config as cfg_mod
-    root = Path(data_dir)
-    cfg_mod.SETTINGS = cfg_mod.Settings(
-        npet2_root        = root,
-        runs_root         = root / "runs",
-        cache_root        = root / "cache",
-        poisson_recon_bin = str(root / "bin" / "PoissonRecon"),
-        riboxyz_api_base  = cfg_mod.SETTINGS.riboxyz_api_base,
-    )
-def _run_single(rcsb_id: str, args, config, output_root: Optional[Path]) -> dict:
-    from libnpet.run import run_npet2
-
-    _apply_data_dir(args) 
-    try:
-        sp, lp = _make_providers(args, rcsb_id)
-
-        if output_root:
-            import libnpet.core.config as cfg_mod
-            cfg_mod.SETTINGS = cfg_mod.Settings(
-                runs_root=output_root,
-                npet2_root=cfg_mod.SETTINGS.npet2_root,
-                cache_root=cfg_mod.SETTINGS.cache_root,
-                poisson_recon_bin=cfg_mod.SETTINGS.poisson_recon_bin,
-                riboxyz_api_base=cfg_mod.SETTINGS.riboxyz_api_base,
-            )
-
-        ctx = run_npet2(rcsb_id, config, structure_provider=sp, landmark_provider=lp)
-        return {"rcsb_id": rcsb_id, "status": "success", "run_dir": str(ctx.store.run_dir)}
-    except Exception as e:
-        return {
-            "rcsb_id": rcsb_id,
-            "status": "failed",
-            "error": str(e),
-            "traceback": traceback.format_exc(),
-        }
-
-
-def _run_worker(packed_args: tuple) -> dict:
-    rcsb_id, args_ns, config_dict, output_root_str = packed_args
-    from libnpet.core.config import RunConfig, GridLevelConfig
-
-    if "grid_levels" in config_dict:
-        config_dict["grid_levels"] = [GridLevelConfig(**gl) for gl in config_dict["grid_levels"]]
-    config = RunConfig(**config_dict)
-    output_root = Path(output_root_str) if output_root_str else None
-    return _run_single(rcsb_id, args_ns, config, output_root)
+# Batch helpers (data-dir overrides, providers, single-structure runner, and
+# the multiprocessing worker) live in libnpet._batch so ProcessPoolExecutor's
+# spawned workers can pickle/unpickle them. See libnpet/_batch.py for why.
+from libnpet._batch import (
+    apply_data_dir as _apply_data_dir,
+    make_providers as _make_providers,
+    run_single as _run_single,
+    run_worker as _run_worker,
+)
 
 def _cmd_setup(args=None):
     import platform
