@@ -1,0 +1,35 @@
+# 23 ribosome structures from the exit-tunnel-comparison paper.
+# One RCSB ID per line; lines starting with # ignored by --from-file.
+# Kingdom labels are tracked in scripts/compare_centerlines.py
+# (look up KINGDOM_BY_PDB there for the source of truth).
+#
+# bacteria
+5NJT
+5AFI
+5JVG
+5MYJ
+5O60
+5V7Q
+5NRG
+4Y4P
+3J7Z
+5VP2
+#
+# archaea
+4V9F
+4V6U
+#
+# eukarya
+6EK0
+5T2A
+3J79
+5GAK
+4V7E
+5T5H
+5XXB
+5XY3
+4UG0
+#
+# organellar
+5X8T
+3J9M
