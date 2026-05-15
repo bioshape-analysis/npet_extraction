@@ -19,14 +19,19 @@ from libnpet.backends.centerline import (
     load_grid_spec,
     mask_z_range_A,
     prune_side_channels,
+    render_centerline_overview_png,
     resample_polyline_uniform,
     shortest_path_in_mask,
     voxel_nearest_point_c0,
     voxel_path_to_c0,
     write_centerline_csv,
+    write_centerline_pdb,
     write_centerline_ply,
+    write_centerline_rings_ply,
+    write_chimerax_view_script,
+    write_pymol_view_script,
 )
-from libnpet.backends.geometry import transform_points_from_C0
+from libnpet.backends.geometry import get_transformation_to_C0, transform_points_from_C0
 from libnpet.core.pipeline import Stage
 from libnpet.core.types import ArtifactType, StageContext
 
@@ -163,6 +168,9 @@ class Stage60Centerline(Stage):
 
         # ------------------------------------------------ world-frame coordinates
         pts_world = transform_points_from_C0(pts_c0.astype(np.float32), ptc_world, constr_world).astype(np.float32)
+        # Tangent vectors are directions, so only the rotation applies.
+        _, rot = get_transformation_to_C0(ptc_world, constr_world)
+        tan_world = (tan_c0.astype(np.float64) @ rot).astype(np.float32)
 
         # ---------------------------------------------------------- write outputs
         csv_path = stage_dir / "centerline.csv"
@@ -177,6 +185,52 @@ class Stage60Centerline(Stage):
 
         ply_path = stage_dir / "centerline.ply"
         write_centerline_ply(ply_path, pts_world, inscribed_A, cross_A)
+
+        rings_path = stage_dir / "centerline_rings.ply"
+        write_centerline_rings_ply(
+            rings_path, pts_world, tan_world, inscribed_A,
+            ring_spacing_A=max(1.0, 2.0 * step_A),
+        )
+
+        pdb_path = stage_dir / "centerline_atoms.pdb"
+        write_centerline_pdb(pdb_path, pts_world, inscribed_A, cross_A)
+
+        # Viewer scripts (PyMOL .pml, ChimeraX .cxc). Paths are relative to
+        # this stage dir so the scripts work no matter where the run is moved.
+        surface_mesh_path = (
+            Path(ctx.store.stage_dir("55_grid_refine")) / "mesh_level_1.ply"
+        )
+        surface_mesh_rel = (
+            f"../55_grid_refine/{surface_mesh_path.name}"
+            if surface_mesh_path.exists() else None
+        )
+        pml_path = stage_dir / "view_pymol.pml"
+        write_pymol_view_script(
+            pml_path,
+            surface_mesh_rel=surface_mesh_rel,
+            rings_rel=rings_path.name,
+            atoms_rel=pdb_path.name,
+        )
+        cxc_path = stage_dir / "view_chimerax.cxc"
+        write_chimerax_view_script(
+            cxc_path,
+            surface_mesh_rel=surface_mesh_rel,
+            rings_rel=rings_path.name,
+            atoms_rel=pdb_path.name,
+        )
+
+        # Static overview PNG (best-effort; offscreen rendering can fail on
+        # some headless boxes, don't take the whole stage down for it).
+        png_path = stage_dir / "centerline_overview.png"
+        try:
+            render_centerline_overview_png(
+                png_path,
+                rings_path=rings_path,
+                surface_mesh_path=surface_mesh_path if surface_mesh_path.exists() else None,
+            )
+        except Exception as e:
+            print(f"[{self.key}] overview PNG render failed: {e}")
+            png_path = None
 
         # ------------------------------------------------------- summary metrics
         bottleneck_idx = int(np.argmin(inscribed_A))
@@ -227,6 +281,47 @@ class Stage60Centerline(Stage):
             meta={"polyline": True},
             depends_on=("centerline_csv",),
         )
+        ctx.store.register_file(
+            name="centerline_rings",
+            stage=self.key,
+            type=ArtifactType.PLY_MESH,
+            path=rings_path,
+            meta={"representation": "rings_perpendicular_to_tangent"},
+            depends_on=("centerline_csv",),
+        )
+        ctx.store.register_file(
+            name="centerline_atoms",
+            stage=self.key,
+            type=ArtifactType.PDB,
+            path=pdb_path,
+            meta={
+                "b_factor_meaning": "inscribed_radius_A",
+                "occupancy_meaning": "cross_section_radius_A",
+            },
+            depends_on=("centerline_csv",),
+        )
+        ctx.store.register_file(
+            name="view_pymol",
+            stage=self.key,
+            type=ArtifactType.TXT,
+            path=pml_path,
+            meta={"viewer": "pymol"},
+        )
+        ctx.store.register_file(
+            name="view_chimerax",
+            stage=self.key,
+            type=ArtifactType.TXT,
+            path=cxc_path,
+            meta={"viewer": "chimerax"},
+        )
+        if png_path is not None and png_path.exists():
+            ctx.store.register_file(
+                name="centerline_overview_png",
+                stage=self.key,
+                type=ArtifactType.PNG,
+                path=png_path,
+                depends_on=("centerline_rings",),
+            )
         ctx.store.put_json(
             name="centerline_summary",
             stage=self.key,

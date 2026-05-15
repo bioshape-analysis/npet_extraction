@@ -529,3 +529,289 @@ def write_centerline_ply(
         absolute=True,
     )
     tube.save(str(out_path), binary=True)
+
+
+# ---------------------------------------------------------------------------
+# Concentric-rings PLY (the visualization the user actually wants:
+# each ring is a thin torus oriented perpendicular to the local tangent,
+# major radius = local tunnel radius. Geometry alone encodes radius, so the
+# file is self-contained and renders in PyMOL/ChimeraX/Mol*/MeshLab/Blender.)
+# ---------------------------------------------------------------------------
+
+
+def _build_ring_torus(
+    center: np.ndarray,
+    tangent: np.ndarray,
+    ring_radius_A: float,
+    tube_radius_A: float,
+    n_circle: int,
+    n_tube: int,
+):
+    import pyvista as pv
+
+    t = np.asarray(tangent, dtype=np.float64)
+    tn = float(np.linalg.norm(t))
+    if tn < 1e-9:
+        return None
+    t = t / tn
+    ref = np.array([1.0, 0.0, 0.0]) if abs(t[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(t, ref)
+    u = u / float(np.linalg.norm(u))
+    v = np.cross(t, u)
+
+    thetas = np.linspace(0.0, 2.0 * np.pi, int(n_circle), endpoint=False)
+    circle = (
+        np.asarray(center, dtype=np.float64)[None, :]
+        + float(ring_radius_A) * (
+            np.cos(thetas)[:, None] * u[None, :]
+            + np.sin(thetas)[:, None] * v[None, :]
+        )
+    )
+    poly = pv.PolyData(circle.astype(np.float32))
+    # closed polyline: returns to vertex 0
+    poly.lines = np.concatenate(
+        [[int(n_circle) + 1], np.arange(int(n_circle), dtype=np.int64), [0]]
+    ).astype(np.int64)
+    return poly.tube(radius=float(tube_radius_A), n_sides=int(n_tube))
+
+
+def write_centerline_rings_ply(
+    out_path: Path,
+    points_world: np.ndarray,
+    tangents_world: np.ndarray,
+    radii_A: np.ndarray,
+    *,
+    ring_spacing_A: float = 1.0,
+    tube_radius_A: float = 0.15,
+    n_circle: int = 24,
+    n_tube: int = 4,
+    min_radius_A: float = 0.3,
+) -> None:
+    """Write a PLY containing one thin torus per centerline sample (subsampled
+    at `ring_spacing_A`). Each torus is oriented perpendicular to the local
+    tangent with major radius equal to the local tunnel radius.
+
+    The file is fully self-contained: geometry alone encodes (centerline
+    position, local radius, local axis direction). No per-vertex scalars
+    needed, so the PLY round-trips through every viewer (PyMOL/ChimeraX/Mol*/
+    MeshLab/Blender/Open3D)."""
+    import pyvista as pv
+
+    pts = np.asarray(points_world, dtype=np.float64)
+    tan = np.asarray(tangents_world, dtype=np.float64)
+    rad = np.asarray(radii_A, dtype=np.float64)
+    n = pts.shape[0]
+    if n < 2:
+        raise ValueError(f"need at least 2 centerline points to draw rings (got {n})")
+
+    diffs = np.diff(pts, axis=0)
+    seg_lens = np.linalg.norm(diffs, axis=1)
+    arc = np.concatenate([[0.0], np.cumsum(seg_lens)])
+    total = float(arc[-1])
+
+    target_arcs = np.arange(0.0, total + 1e-9, float(ring_spacing_A))
+    if target_arcs[-1] < total - 0.5 * float(ring_spacing_A):
+        target_arcs = np.concatenate([target_arcs, [total]])
+    ring_idx = np.searchsorted(arc, target_arcs).clip(0, n - 1)
+
+    meshes = []
+    for i in ring_idx:
+        r = max(float(min_radius_A), float(rad[i]))
+        ring = _build_ring_torus(
+            pts[i], tan[i], r,
+            tube_radius_A=float(tube_radius_A),
+            n_circle=int(n_circle),
+            n_tube=int(n_tube),
+        )
+        if ring is not None and ring.n_points > 0:
+            meshes.append(ring)
+
+    if not meshes:
+        raise ValueError("no rings produced")
+
+    combined = meshes[0]
+    for m in meshes[1:]:
+        combined = combined.merge(m)
+    combined.save(str(out_path), binary=True)
+
+
+# ---------------------------------------------------------------------------
+# Pseudo-PDB (each centerline point = one HETATM, inscribed radius in
+# B-factor, cross-section radius in occupancy). Universally portable: Mol*,
+# PyMOL, ChimeraX, RasMol, VMD all render this as a chain of spheres sized
+# by B-factor.
+# ---------------------------------------------------------------------------
+
+
+def write_centerline_pdb(
+    out_path: Path,
+    points_world: np.ndarray,
+    inscribed_radius_A: np.ndarray,
+    cross_section_radius_A: np.ndarray,
+    *,
+    connect_atoms: bool = True,
+) -> None:
+    """Write a pseudo-PDB where each centerline point is one CA atom of a
+    fake residue 'TUN'. B-factor column = inscribed_radius_A (the MOLE-probe
+    radius). Occupancy column = cross_section_radius_A. CONECT records draw
+    bonds between consecutive atoms so the centerline renders as a line if
+    `show sticks` is used.
+
+    Load in Mol*: drag-and-drop into molstar.org/viewer; set representation
+    to Spacefill; size = B-factor. Same idea in PyMOL/ChimeraX."""
+    pts = np.asarray(points_world, dtype=np.float64)
+    r_in = np.asarray(inscribed_radius_A, dtype=np.float64)
+    r_cs = np.asarray(cross_section_radius_A, dtype=np.float64)
+    n = pts.shape[0]
+
+    lines = [
+        "REMARK   1 NPET2 centerline pseudo-atoms",
+        "REMARK   1 Each HETATM = one centerline point",
+        "REMARK   1 B-factor column = inscribed_radius_A (MOLE probe semantics)",
+        "REMARK   1 Occupancy column = cross_section_radius_A",
+        "REMARK   1 Render as spheres sized by B-factor for the inscribed-",
+        "REMARK   1 sphere envelope.",
+    ]
+    for i in range(n):
+        serial = i + 1
+        resi = (i % 9999) + 1
+        chain = chr(ord("A") + min(25, i // 9999))
+        occ = min(99.99, max(0.0, float(r_cs[i])))
+        b = min(99.99, max(0.0, float(r_in[i])))
+        # PDB cols (1-indexed):
+        #   1-6   record name ("HETATM")
+        #   7-11  atom serial (right-justified)
+        #   13-16 atom name ("CA  ")
+        #   18-20 residue name
+        #   22    chain id
+        #   23-26 residue seq number
+        #   31-38 x
+        #   39-46 y
+        #   47-54 z
+        #   55-60 occupancy
+        #   61-66 b-factor
+        #   77-78 element
+        lines.append(
+            f"HETATM{serial:>5d}  CA  TUN {chain}{resi:>4d}    "
+            f"{pts[i,0]:8.3f}{pts[i,1]:8.3f}{pts[i,2]:8.3f}"
+            f"{occ:6.2f}{b:6.2f}           C  "
+        )
+
+    if connect_atoms:
+        for i in range(n - 1):
+            lines.append(f"CONECT{i+1:>5d}{i+2:>5d}")
+
+    lines.append("END")
+    Path(out_path).write_text("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Viewer scripts (PyMOL .pml, ChimeraX .cxc). Both load: surface mesh +
+# centerline rings + centerline pseudo-atoms, with sensible default styling.
+# Paths are relative to the script's own directory.
+# ---------------------------------------------------------------------------
+
+
+def write_pymol_view_script(
+    out_path: Path,
+    *,
+    surface_mesh_rel: str | None,
+    rings_rel: str,
+    atoms_rel: str,
+) -> None:
+    lines = [
+        "# NPET2 centerline visualization for PyMOL.",
+        "# Usage: `pymol view_pymol.pml` from this directory, or",
+        "#        `@view_pymol.pml` inside PyMOL.",
+        "bg_color white",
+    ]
+    if surface_mesh_rel:
+        lines += [
+            f"load {surface_mesh_rel}, tunnel_surface",
+            "set transparency, 0.6, tunnel_surface",
+            "color grey80, tunnel_surface",
+        ]
+    lines += [
+        f"load {rings_rel}, centerline_rings",
+        "color cyan, centerline_rings",
+        "",
+        f"load {atoms_rel}, centerline_atoms",
+        "hide everything, centerline_atoms",
+        "show spheres, centerline_atoms",
+        "alter centerline_atoms, vdw=b",
+        "rebuild",
+        "spectrum b, blue_white_red, centerline_atoms",
+        "",
+        "orient",
+        "zoom centerline_rings, 5",
+    ]
+    Path(out_path).write_text("\n".join(lines) + "\n")
+
+
+def write_chimerax_view_script(
+    out_path: Path,
+    *,
+    surface_mesh_rel: str | None,
+    rings_rel: str,
+    atoms_rel: str,
+) -> None:
+    lines = [
+        "# NPET2 centerline visualization for ChimeraX.",
+        "# Usage: `open view_chimerax.cxc` inside ChimeraX.",
+        "set bgColor white",
+    ]
+    model_idx = 1
+    if surface_mesh_rel:
+        lines += [
+            f"open {surface_mesh_rel}",
+            f"transparency #{model_idx} 60 target s",
+            f"color #{model_idx} light gray",
+        ]
+        model_idx += 1
+    rings_idx = model_idx
+    lines += [
+        f"open {rings_rel}",
+        f"color #{rings_idx} dodger blue",
+    ]
+    model_idx += 1
+    atoms_idx = model_idx
+    lines += [
+        f"open {atoms_rel}",
+        f"style #{atoms_idx} sphere",
+        f"size #{atoms_idx} atomRadius byattribute bfactor",
+        f"color bfactor #{atoms_idx} palette blue-white-red",
+        "view",
+    ]
+    Path(out_path).write_text("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Static overview PNG (pyvista offscreen). Compose: tunnel surface (translucent
+# grey) + centerline rings (blue). Useful as a thumbnail in run dirs / reports.
+# ---------------------------------------------------------------------------
+
+
+def render_centerline_overview_png(
+    out_path: Path,
+    *,
+    rings_path: Path,
+    surface_mesh_path: Path | None = None,
+    size: Tuple[int, int] = (1280, 960),
+) -> None:
+    import pyvista as pv
+
+    pl = pv.Plotter(off_screen=True, window_size=size)
+    pl.set_background("white")
+
+    if surface_mesh_path is not None and Path(surface_mesh_path).exists():
+        try:
+            surf = pv.read(str(surface_mesh_path))
+            pl.add_mesh(surf, color="lightgray", opacity=0.25, smooth_shading=True)
+        except Exception:
+            pass  # don't fail the PNG over a bad surface mesh
+
+    rings = pv.read(str(rings_path))
+    pl.add_mesh(rings, color="dodgerblue", smooth_shading=True)
+    pl.add_axes()
+    pl.screenshot(str(out_path), transparent_background=False)
+    pl.close()
