@@ -27,7 +27,6 @@ from libnpet.backends.centerline import (
     write_centerline_csv,
     write_centerline_pdb,
     write_centerline_ply,
-    write_centerline_rings_ply,
     write_chimerax_view_script,
     write_pymol_view_script,
 )
@@ -183,23 +182,27 @@ class Stage60Centerline(Stage):
             cross_section_radius_A=cross_A,
         )
 
+        # Single PLY: thin spine tube along the path + rings perpendicular to
+        # the tangent at every 1A, ring radius = local inscribed_radius_A.
+        # ASCII format because some viewers (Mol*) require it.
         ply_path = stage_dir / "centerline.ply"
-        write_centerline_ply(ply_path, pts_world, inscribed_A, cross_A)
-
-        rings_path = stage_dir / "centerline_rings.ply"
-        write_centerline_rings_ply(
-            rings_path, pts_world, tan_world, inscribed_A,
+        write_centerline_ply(
+            ply_path,
+            pts_world, tan_world, inscribed_A,
             ring_spacing_A=max(1.0, 2.0 * step_A),
+            ascii=True,
         )
 
         pdb_path = stage_dir / "centerline_atoms.pdb"
         write_centerline_pdb(pdb_path, pts_world, inscribed_A, cross_A)
 
-        # Viewer scripts (PyMOL .pml, ChimeraX .cxc). Paths are relative to
-        # this stage dir so the scripts work no matter where the run is moved.
-        surface_mesh_path = (
-            Path(ctx.store.stage_dir("55_grid_refine")) / "mesh_level_1.ply"
-        )
+        # Viewer scripts. Paths are relative to this stage dir so the scripts
+        # work no matter where the run is moved. Prefer the ASCII surface mesh
+        # (Stage55 emits both binary and ASCII side-by-side).
+        s55_dir = Path(ctx.store.stage_dir("55_grid_refine"))
+        ascii_surf = s55_dir / "mesh_level_1_ascii.ply"
+        bin_surf = s55_dir / "mesh_level_1.ply"
+        surface_mesh_path = ascii_surf if ascii_surf.exists() else bin_surf
         surface_mesh_rel = (
             f"../55_grid_refine/{surface_mesh_path.name}"
             if surface_mesh_path.exists() else None
@@ -208,14 +211,14 @@ class Stage60Centerline(Stage):
         write_pymol_view_script(
             pml_path,
             surface_mesh_rel=surface_mesh_rel,
-            rings_rel=rings_path.name,
+            centerline_ply_rel=ply_path.name,
             atoms_rel=pdb_path.name,
         )
         cxc_path = stage_dir / "view_chimerax.cxc"
         write_chimerax_view_script(
             cxc_path,
             surface_mesh_rel=surface_mesh_rel,
-            rings_rel=rings_path.name,
+            centerline_ply_rel=ply_path.name,
             atoms_rel=pdb_path.name,
         )
 
@@ -225,7 +228,7 @@ class Stage60Centerline(Stage):
         try:
             render_centerline_overview_png(
                 png_path,
-                rings_path=rings_path,
+                centerline_ply_path=ply_path,
                 surface_mesh_path=surface_mesh_path if surface_mesh_path.exists() else None,
             )
         except Exception as e:
@@ -274,19 +277,15 @@ class Stage60Centerline(Stage):
             depends_on=("refined_surface_points_level_1",),
         )
         ctx.store.register_file(
-            name="centerline_polyline",
+            name="centerline_ply",
             stage=self.key,
             type=ArtifactType.PLY_MESH,
             path=ply_path,
-            meta={"polyline": True},
-            depends_on=("centerline_csv",),
-        )
-        ctx.store.register_file(
-            name="centerline_rings",
-            stage=self.key,
-            type=ArtifactType.PLY_MESH,
-            path=rings_path,
-            meta={"representation": "rings_perpendicular_to_tangent"},
+            meta={
+                "format": "ascii",
+                "contents": "spine_tube + rings_perpendicular_to_tangent",
+                "ring_radius_meaning": "inscribed_radius_A",
+            },
             depends_on=("centerline_csv",),
         )
         ctx.store.register_file(
@@ -320,7 +319,7 @@ class Stage60Centerline(Stage):
                 stage=self.key,
                 type=ArtifactType.PNG,
                 path=png_path,
-                depends_on=("centerline_rings",),
+                depends_on=("centerline_ply",),
             )
         ctx.store.put_json(
             name="centerline_summary",

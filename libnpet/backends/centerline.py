@@ -493,52 +493,6 @@ def write_centerline_csv(
             ])
 
 
-def write_centerline_ply(
-    out_path: Path,
-    points_world: np.ndarray,
-    inscribed_radius_A: np.ndarray,
-    cross_section_radius_A: np.ndarray,
-    *,
-    n_sides: int = 16,
-    min_radius_A: float = 0.25,
-) -> None:
-    """Emit a triangulated tube mesh that sweeps the centerline, with each
-    cross-section sized by `inscribed_radius_A`. PLY's polyline support and
-    per-vertex scalar preservation are unreliable across writers and viewers
-    (PyVista's PLY round-trip drops both), so a plain triangulated tube is the
-    robust portable representation. The per-point radius numbers live in the
-    companion CSV.
-    """
-    import pyvista as pv
-
-    pts = np.asarray(points_world, dtype=np.float32)
-    n = pts.shape[0]
-    if n < 2:
-        raise ValueError(f"centerline has too few points to sweep a tube ({n})")
-
-    r_in = np.maximum(np.asarray(inscribed_radius_A, dtype=np.float32), float(min_radius_A))
-
-    poly = pv.PolyData(pts)
-    poly.lines = np.concatenate(([n], np.arange(n, dtype=np.int64))).astype(np.int64)
-    poly["inscribed_radius_A"] = r_in
-
-    tube = poly.tube(
-        scalars="inscribed_radius_A",
-        radius=float(min_radius_A),
-        n_sides=int(n_sides),
-        absolute=True,
-    )
-    tube.save(str(out_path), binary=True)
-
-
-# ---------------------------------------------------------------------------
-# Concentric-rings PLY (the visualization the user actually wants:
-# each ring is a thin torus oriented perpendicular to the local tangent,
-# major radius = local tunnel radius. Geometry alone encodes radius, so the
-# file is self-contained and renders in PyMOL/ChimeraX/Mol*/MeshLab/Blender.)
-# ---------------------------------------------------------------------------
-
-
 def _build_ring_torus(
     center: np.ndarray,
     tangent: np.ndarray,
@@ -568,71 +522,78 @@ def _build_ring_torus(
         )
     )
     poly = pv.PolyData(circle.astype(np.float32))
-    # closed polyline: returns to vertex 0
     poly.lines = np.concatenate(
         [[int(n_circle) + 1], np.arange(int(n_circle), dtype=np.int64), [0]]
     ).astype(np.int64)
     return poly.tube(radius=float(tube_radius_A), n_sides=int(n_tube))
 
 
-def write_centerline_rings_ply(
+def write_centerline_ply(
     out_path: Path,
     points_world: np.ndarray,
     tangents_world: np.ndarray,
-    radii_A: np.ndarray,
+    inscribed_radius_A: np.ndarray,
     *,
+    spine_radius_A: float = 0.2,
     ring_spacing_A: float = 1.0,
-    tube_radius_A: float = 0.15,
+    ring_tube_radius_A: float = 0.15,
     n_circle: int = 24,
     n_tube: int = 4,
     min_radius_A: float = 0.3,
+    ascii: bool = True,
 ) -> None:
-    """Write a PLY containing one thin torus per centerline sample (subsampled
-    at `ring_spacing_A`). Each torus is oriented perpendicular to the local
-    tangent with major radius equal to the local tunnel radius.
+    """Write ONE PLY containing both:
+      - the centerline path itself, as a thin spine tube of constant radius;
+      - rings (thin tori) at every `ring_spacing_A` along the path, each
+        perpendicular to the local tangent with major radius equal to the
+        local inscribed_radius_A.
 
-    The file is fully self-contained: geometry alone encodes (centerline
-    position, local radius, local axis direction). No per-vertex scalars
-    needed, so the PLY round-trips through every viewer (PyMOL/ChimeraX/Mol*/
-    MeshLab/Blender/Open3D)."""
+    Geometry alone encodes (position, radius, axis direction), so the file is
+    fully self-contained — no per-vertex scalar fields that PLY round-trips
+    might drop. Saved as ASCII by default (binary=False) because some viewers
+    (e.g. Mol*) prefer ASCII PLY."""
     import pyvista as pv
 
     pts = np.asarray(points_world, dtype=np.float64)
     tan = np.asarray(tangents_world, dtype=np.float64)
-    rad = np.asarray(radii_A, dtype=np.float64)
+    rad = np.asarray(inscribed_radius_A, dtype=np.float64)
     n = pts.shape[0]
     if n < 2:
-        raise ValueError(f"need at least 2 centerline points to draw rings (got {n})")
+        raise ValueError(f"need at least 2 centerline points (got {n})")
 
+    # Spine: thin constant-radius tube along the centerline.
+    spine_poly = pv.PolyData(pts.astype(np.float32))
+    spine_poly.lines = np.concatenate(
+        [[n], np.arange(n, dtype=np.int64)]
+    ).astype(np.int64)
+    spine = spine_poly.tube(radius=float(spine_radius_A), n_sides=int(n_tube))
+
+    # Rings at every ring_spacing_A along arc length.
     diffs = np.diff(pts, axis=0)
     seg_lens = np.linalg.norm(diffs, axis=1)
     arc = np.concatenate([[0.0], np.cumsum(seg_lens)])
     total = float(arc[-1])
-
     target_arcs = np.arange(0.0, total + 1e-9, float(ring_spacing_A))
-    if target_arcs[-1] < total - 0.5 * float(ring_spacing_A):
+    if target_arcs.size > 0 and target_arcs[-1] < total - 0.5 * float(ring_spacing_A):
         target_arcs = np.concatenate([target_arcs, [total]])
     ring_idx = np.searchsorted(arc, target_arcs).clip(0, n - 1)
 
-    meshes = []
+    meshes = [spine]
     for i in ring_idx:
         r = max(float(min_radius_A), float(rad[i]))
         ring = _build_ring_torus(
             pts[i], tan[i], r,
-            tube_radius_A=float(tube_radius_A),
+            tube_radius_A=float(ring_tube_radius_A),
             n_circle=int(n_circle),
             n_tube=int(n_tube),
         )
         if ring is not None and ring.n_points > 0:
             meshes.append(ring)
 
-    if not meshes:
-        raise ValueError("no rings produced")
-
     combined = meshes[0]
     for m in meshes[1:]:
         combined = combined.merge(m)
-    combined.save(str(out_path), binary=True)
+    combined.save(str(out_path), binary=not bool(ascii))
 
 
 # ---------------------------------------------------------------------------
@@ -716,7 +677,7 @@ def write_pymol_view_script(
     out_path: Path,
     *,
     surface_mesh_rel: str | None,
-    rings_rel: str,
+    centerline_ply_rel: str,
     atoms_rel: str,
 ) -> None:
     lines = [
@@ -732,8 +693,8 @@ def write_pymol_view_script(
             "color grey80, tunnel_surface",
         ]
     lines += [
-        f"load {rings_rel}, centerline_rings",
-        "color cyan, centerline_rings",
+        f"load {centerline_ply_rel}, centerline",
+        "color cyan, centerline",
         "",
         f"load {atoms_rel}, centerline_atoms",
         "hide everything, centerline_atoms",
@@ -743,7 +704,7 @@ def write_pymol_view_script(
         "spectrum b, blue_white_red, centerline_atoms",
         "",
         "orient",
-        "zoom centerline_rings, 5",
+        "zoom centerline, 5",
     ]
     Path(out_path).write_text("\n".join(lines) + "\n")
 
@@ -752,7 +713,7 @@ def write_chimerax_view_script(
     out_path: Path,
     *,
     surface_mesh_rel: str | None,
-    rings_rel: str,
+    centerline_ply_rel: str,
     atoms_rel: str,
 ) -> None:
     lines = [
@@ -768,10 +729,10 @@ def write_chimerax_view_script(
             f"color #{model_idx} light gray",
         ]
         model_idx += 1
-    rings_idx = model_idx
+    cl_idx = model_idx
     lines += [
-        f"open {rings_rel}",
-        f"color #{rings_idx} dodger blue",
+        f"open {centerline_ply_rel}",
+        f"color #{cl_idx} dodger blue",
     ]
     model_idx += 1
     atoms_idx = model_idx
@@ -794,7 +755,7 @@ def write_chimerax_view_script(
 def render_centerline_overview_png(
     out_path: Path,
     *,
-    rings_path: Path,
+    centerline_ply_path: Path,
     surface_mesh_path: Path | None = None,
     size: Tuple[int, int] = (1280, 960),
 ) -> None:
@@ -808,10 +769,10 @@ def render_centerline_overview_png(
             surf = pv.read(str(surface_mesh_path))
             pl.add_mesh(surf, color="lightgray", opacity=0.25, smooth_shading=True)
         except Exception:
-            pass  # don't fail the PNG over a bad surface mesh
+            pass
 
-    rings = pv.read(str(rings_path))
-    pl.add_mesh(rings, color="dodgerblue", smooth_shading=True)
+    centerline = pv.read(str(centerline_ply_path))
+    pl.add_mesh(centerline, color="dodgerblue", smooth_shading=True)
     pl.add_axes()
     pl.screenshot(str(out_path), transparent_background=False)
     pl.close()
